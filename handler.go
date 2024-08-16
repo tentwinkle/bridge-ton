@@ -47,10 +47,11 @@ type stream struct {
 	mux      sync.RWMutex
 }
 type handler struct {
-	Mux         sync.RWMutex
-	Connections map[string]*stream
-	storage     db
-	_eventIDs   int64
+	Mux               sync.RWMutex
+	Connections       map[string]*stream
+	storage           db
+	_eventIDs         int64
+	heartbeatInterval time.Duration
 }
 
 type db interface {
@@ -58,12 +59,13 @@ type db interface {
 	Add(ctx context.Context, key string, ttl int64, mes datatype.SseMessage) error
 }
 
-func newHandler(db db) *handler {
+func newHandler(db db, heartbeatInterval time.Duration) *handler {
 	h := handler{
-		Mux:         sync.RWMutex{},
-		Connections: make(map[string]*stream),
-		storage:     db,
-		_eventIDs:   time.Now().UnixMicro(),
+		Mux:               sync.RWMutex{},
+		Connections:       make(map[string]*stream),
+		storage:           db,
+		_eventIDs:         time.Now().UnixMicro(),
+		heartbeatInterval: heartbeatInterval,
 	}
 	return &h
 }
@@ -124,23 +126,28 @@ func (h *handler) EventRegistrationHandler(c echo.Context) error {
 		h.removeConnection(session)
 		log.Infof("connection: %v closed with error %v", session.ClientIds, ctx.Err())
 	}()
-
+	ticker := time.NewTicker(h.heartbeatInterval)
+	defer ticker.Stop()
 	session.Start()
 loop:
 	for {
 		select {
-		case msg := <-session.MessageCh:
+		case msg, ok := <-session.MessageCh:
+			if !ok {
+				log.Errorf("can't read from channel")
+				break loop
+			}
 			_, err = fmt.Fprintf(c.Response(), "event: %v\nid: %v\ndata: %v\n\n", "message", msg.EventId, string(msg.Message))
 			if err != nil {
-				log.Errorf("can't write to connection: %v", err)
+				log.Errorf("msg can't write to connection: %v", err)
 				break loop
 			}
 			c.Response().Flush()
 			deliveredMessagesMetric.Inc()
-		case <-time.NewTimer(time.Second * 2).C:
+		case <-ticker.C:
 			_, err = fmt.Fprintf(c.Response(), "event: heartbeat\n\n")
 			if err != nil {
-				log.Errorf("can't write to connection: %v", err)
+				log.Errorf("ticker can't write to connection: %v", err)
 				break loop
 			}
 			c.Response().Flush()
@@ -218,7 +225,9 @@ func (h *handler) SendMessageHandler(c echo.Context) error {
 		EventId: h.nextID(),
 		Message: mes,
 	}
+	h.Mux.RLock()
 	s, ok := h.Connections[toId[0]]
+	h.Mux.RUnlock()
 	if ok {
 		s.mux.Lock()
 		for _, ses := range s.Sessions {
@@ -265,10 +274,8 @@ func (h *handler) removeConnection(ses *Session) {
 			delete(h.Connections, id)
 			h.Mux.Unlock()
 		}
-
+		activeSubscriptionsMetric.Dec()
 	}
-	activeSubscriptionsMetric.Dec()
-
 }
 
 func (h *handler) CreateSession(sessionId string, clientIds []string, lastEventId int64) *Session {
