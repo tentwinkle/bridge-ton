@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,6 +18,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	log "github.com/sirupsen/logrus"
+	"github.com/tonkeeper/bridge/config"
 	"github.com/tonkeeper/bridge/datatype"
 )
 
@@ -39,6 +42,10 @@ var (
 	badRequestMetric = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "number_of_bad_requests",
 		Help: "The total number of bad requests",
+	})
+	clientIdsPerConnectionMetric = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "number_of_client_ids_per_connection",
+		Buckets: []float64{1, 2, 3, 4, 5, 10, 20, 30, 40, 50, 100},
 	})
 )
 
@@ -116,6 +123,7 @@ func (h *handler) EventRegistrationHandler(c echo.Context) error {
 		return c.JSON(HttpResError(errorMsg, http.StatusBadRequest))
 	}
 	clientIds := strings.Split(clientId[0], ",")
+	clientIdsPerConnectionMetric.Observe(float64(len(clientIds)))
 	session := h.CreateSession(clientId[0], clientIds, lastEventId)
 
 	ctx := c.Request().Context()
@@ -213,7 +221,20 @@ func (h *handler) SendMessageHandler(c echo.Context) error {
 		log.Error(err)
 		return c.JSON(HttpResError(err.Error(), http.StatusBadRequest))
 	}
-
+	if config.Config.CopyToURL != "" {
+		go func() {
+			u, err := url.Parse(config.Config.CopyToURL)
+			if err != nil {
+				return
+			}
+			u.RawQuery = params.Encode()
+			req, err := http.NewRequest(http.MethodPost, u.String(), bytes.NewReader(message))
+			if err != nil {
+				return
+			}
+			http.DefaultClient.Do(req)
+		}()
+	}
 	topic, ok := params["topic"]
 	if ok {
 		go func(clientID, topic, message string) {
